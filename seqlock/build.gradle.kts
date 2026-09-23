@@ -108,13 +108,28 @@ mavenPublishing {
     publishToMavenCentral()
     signAllPublications()
     pom {
+        name.set(project.name)
+        description.set(project.description)
+        inceptionYear.set("2026")
+        url.set("https://github.com/deephaven/deephaven-seqlock/")
         licenses {
             license {
-                // SPDX identifier, as the Maven POM reference recommends.
                 name.set("Apache-2.0")
                 url.set("https://www.apache.org/licenses/LICENSE-2.0.txt")
                 distribution.set("repo")
             }
+        }
+        developers {
+            developer {
+                id = "devinrsmith"
+                name = "Devin Smith"
+                url = "https://github.com/devinrsmith/"
+            }
+        }
+        scm {
+            url = "https://github.com/deephaven/deephaven-seqlock/"
+            connection = "scm:git:git://github.com/deephaven/deephaven-seqlock.git"
+            developerConnection = "scm:git:ssh://git@github.com/deephaven/deephaven-seqlock.git"
         }
     }
 }
