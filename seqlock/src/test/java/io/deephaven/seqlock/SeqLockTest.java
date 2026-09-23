@@ -52,6 +52,39 @@ class SeqLockTest {
   }
 
   @Test
+  void validateFailsAfterAnInterveningWrite() {
+    final long stamp = lock.beginRead();
+    lock.beginWrite();
+    lock.endWrite();
+    assertThat(lock.validate(stamp)).isFalse();
+    // A fresh stamp taken after the write validates.
+    assertThat(lock.validate(lock.beginRead())).isTrue();
+  }
+
+  @Test
+  void validateFailsWhileAWriteIsInProgress() {
+    final long stamp = lock.beginRead();
+    lock.beginWrite();
+    try {
+      assertThat(lock.validate(stamp)).isFalse();
+    } finally {
+      lock.endWrite();
+    }
+    // And stays stale once that write has completed.
+    assertThat(lock.validate(stamp)).isFalse();
+  }
+
+  @Test
+  void staleStampNeverValidatesAgain() {
+    final long stamp = lock.beginRead();
+    for (int i = 0; i < 1000; i++) {
+      lock.beginWrite();
+      lock.endWrite();
+      assertThat(lock.validate(stamp)).isFalse();
+    }
+  }
+
+  @Test
   void beginReadInterruptible() throws InterruptedException {
     final long stamp = lock.beginReadInterruptible();
     assertThat(lock.validate(stamp)).isTrue();
@@ -66,6 +99,39 @@ class SeqLockTest {
     } catch (InterruptedException e) {
       // expected
     }
+  }
+
+  @Test
+  void beginReadInterruptibleThrowsIfInterruptedWhileSpinning() throws InterruptedException {
+    // Interrupt from another thread, ~30ms in, so the interrupt lands while beginReadInterruptible
+    // is spinning on the held write -- interrupting up front would instead trip its initial
+    // interrupted() check before it ever spun.
+    final Thread interrupter = interruptCurrentThreadAfter(30);
+    lock.beginWrite();
+    try {
+      lock.beginReadInterruptible();
+      failBecauseExceptionWasNotThrown(InterruptedException.class);
+    } catch (InterruptedException e) {
+      // expected; throwing it also cleared the interrupt flag
+    } finally {
+      lock.endWrite();
+    }
+    interrupter.join();
+  }
+
+  @Test
+  void beginReadPreservesInterruptFlag() throws InterruptedException {
+    final long[] protectedValue = new long[1];
+    final Thread writer = startWriterHoldingWriteSection(protectedValue);
+    Thread.currentThread().interrupt();
+    final long stamp = lock.beginRead();
+    // Spins straight through the interrupt and leaves the flag set for the caller.
+    // Thread.interrupted() both checks and clears it, which also keeps the still-set flag from
+    // making writer.join() below throw.
+    assertThat(Thread.interrupted()).isTrue();
+    writer.join();
+    assertThat(lock.validate(stamp)).isTrue();
+    assertThat(protectedValue[0]).isEqualTo(42L);
   }
 
   @Test
@@ -156,24 +222,12 @@ class SeqLockTest {
 
   @Test
   void tryBeginReadInterruptiblePollThrowsIfInterruptedDuringWait() throws InterruptedException {
-    final Thread testThread = Thread.currentThread();
     // Interrupt from another thread, ~30ms in, so the interrupt lands while
     // tryBeginReadInterruptible is asleep between polls -- interrupting up front would instead trip
     // its initial interrupted() check before it ever slept.
-    final Thread interrupter =
-        new Thread(
-            () -> {
-              try {
-                Thread.sleep(30);
-              } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return;
-              }
-              testThread.interrupt();
-            });
+    final Thread interrupter = interruptCurrentThreadAfter(30);
     lock.beginWrite();
     try {
-      interrupter.start();
       lock.tryBeginReadInterruptible(5, 2000, TimeUnit.MILLISECONDS);
       failBecauseExceptionWasNotThrown(InterruptedException.class);
     } catch (InterruptedException e) {
@@ -269,6 +323,24 @@ class SeqLockTest {
     writer.start();
     writeStarted.await();
     return writer;
+  }
+
+  /** Starts a thread that interrupts the calling thread after ~{@code delayMillis}. */
+  private static Thread interruptCurrentThreadAfter(long delayMillis) {
+    final Thread target = Thread.currentThread();
+    final Thread interrupter =
+        new Thread(
+            () -> {
+              try {
+                Thread.sleep(delayMillis);
+              } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+              }
+              target.interrupt();
+            });
+    interrupter.start();
+    return interrupter;
   }
 
   private static void shouldError(Runnable runnable) {
