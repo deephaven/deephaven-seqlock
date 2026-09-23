@@ -246,8 +246,7 @@ public final class SeqLock {
       return stamp;
     }
     final long pollIntervalMillis = Math.max(1, unit.toMillis(pollInterval));
-    // The only System.nanoTime() call needed if the very next poll succeeds.
-    final long deadlineNanos = System.nanoTime() + totalWaitNanos;
+    final long startNanos = System.nanoTime();
     boolean interrupted = false;
     do {
       try {
@@ -258,7 +257,7 @@ public final class SeqLock {
         // busy loop for the rest of totalWait. Restored once, below, just before returning.
         interrupted = true;
       }
-    } while (!isReadStampImpl(stamp = sequence) && System.nanoTime() < deadlineNanos);
+    } while (!isReadStampImpl(stamp = sequence) && System.nanoTime() - startNanos < totalWaitNanos);
     if (interrupted) {
       Thread.currentThread().interrupt();
     }
@@ -290,14 +289,13 @@ public final class SeqLock {
       return stamp;
     }
     final long pollIntervalMillis = Math.max(1, unit.toMillis(pollInterval));
-    // The only System.nanoTime() call needed if the very next poll succeeds.
-    final long deadlineNanos = System.nanoTime() + totalWaitNanos;
+    final long startNanos = System.nanoTime();
     do {
       Thread.sleep(pollIntervalMillis);
       if (isReadStampImpl(stamp = sequence)) {
         return stamp;
       }
-    } while (System.nanoTime() < deadlineNanos);
+    } while (System.nanoTime() - startNanos < totalWaitNanos);
     return stamp;
   }
 
