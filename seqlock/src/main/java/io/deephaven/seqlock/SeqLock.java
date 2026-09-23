@@ -275,11 +275,14 @@ public final class SeqLock {
    *     {@code pollInterval}
    * @param unit the unit both {@code pollInterval} and {@code totalWait} are expressed in
    * @return a potential read stamp
-   * @throws InterruptedException if interrupted while sleeping between polls
+   * @throws InterruptedException if interrupted before or while sleeping between polls
    */
   public long tryBeginReadInterruptible(
       final long pollInterval, final long totalWait, final TimeUnit unit)
       throws InterruptedException {
+    if (Thread.interrupted()) {
+      throw new InterruptedException();
+    }
     long stamp;
     if (isReadStampImpl(stamp = sequence)) {
       return stamp;

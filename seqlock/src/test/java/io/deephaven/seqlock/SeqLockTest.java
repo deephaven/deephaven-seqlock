@@ -185,6 +185,19 @@ class SeqLockTest {
   }
 
   @Test
+  void tryBeginReadInterruptiblePollThrowsIfInterrupted() {
+    try {
+      Thread.currentThread().interrupt();
+      lock.tryBeginReadInterruptible(10, 1000, TimeUnit.MILLISECONDS);
+      failBecauseExceptionWasNotThrown(InterruptedException.class);
+    } catch (InterruptedException e) {
+      // expected
+    } finally {
+      Thread.interrupted(); // clear the flag
+    }
+  }
+
+  @Test
   void tryBeginReadInterruptiblePollThrowsIfInterruptedDuringWait() {
     lock.beginWrite();
     try {
@@ -259,9 +272,10 @@ class SeqLockTest {
   private static void shouldError(Runnable runnable) {
     try {
       runnable.run();
-      failBecauseExceptionWasNotThrown(AssertionError.class);
-    } catch (final AssertionError | IllegalMonitorStateException e) {
+    } catch (final AssertionError e) {
       // expected
+      return;
     }
+    failBecauseExceptionWasNotThrown(AssertionError.class);
   }
 }
