@@ -1,0 +1,6 @@
+inputs:
+  nixpkgs:
+    url: github:cachix/devenv-nixpkgs/rolling
+  nix-gradle-wrapper:
+    url: github:devinrsmith/nix-gradle-wrapper
+    flake: false
