@@ -125,17 +125,11 @@ class SeqLockTest {
     final long[] protectedValue = new long[1];
     final Thread writer = startWriterHoldingWriteSection(protectedValue);
     Thread.currentThread().interrupt();
-    final long stamp;
-    try {
-      stamp = lock.tryBeginRead(5, 2000, TimeUnit.MILLISECONDS);
-      // Doesn't abort polling on interruption, but restores the flag before returning so the
-      // caller can still observe it afterward -- isInterrupted() (unlike Thread.interrupted())
-      // doesn't itself clear the flag. Checked here, before any other blocking call (e.g.
-      // writer.join() below), since the still-set flag would otherwise make that call throw too.
-      assertThat(Thread.currentThread().isInterrupted()).isTrue();
-    } finally {
-      Thread.interrupted(); // clear the flag before any further blocking calls
-    }
+    final long stamp = lock.tryBeginRead(5, 2000, TimeUnit.MILLISECONDS);
+    // Doesn't abort polling on interruption, but restores the flag before returning so the caller
+    // can still observe it. Thread.interrupted() both checks and clears it, which also keeps the
+    // still-set flag from making writer.join() below throw.
+    assertThat(Thread.interrupted()).isTrue();
     writer.join();
     assertThat(lock.isReadStamp(stamp)).isTrue();
     assertThat(lock.validate(stamp)).isTrue();
@@ -151,8 +145,8 @@ class SeqLockTest {
 
   @Test
   void tryBeginReadInterruptiblePollThrowsIfInterrupted() {
+    Thread.currentThread().interrupt();
     try {
-      Thread.currentThread().interrupt();
       lock.tryBeginReadInterruptible(10, 1000, TimeUnit.MILLISECONDS);
       failBecauseExceptionWasNotThrown(InterruptedException.class);
     } catch (InterruptedException e) {
