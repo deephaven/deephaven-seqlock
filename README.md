@@ -21,10 +21,6 @@ unconditional either way — but it does assume reads are cheap enough to redo: 
 the longer) writes happen, the more often a given reader's window may land on one and need a
 retry, so keep both the write section and the read section short.
 
-This trades away multi-writer support and blocking semantics for that. If you need either, use
-[`java.util.concurrent.locks.StampedLock`](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/concurrent/locks/StampedLock.html)
-instead.
-
 ## Requirements
 
 Java 8+. `seqlock` ships as a multi-release JAR: the same jar runs on Java 8, but automatically
@@ -74,6 +70,10 @@ try {
 
 That's the entire writer protocol — unlike the reader below, there's no retry loop here, because
 there's nothing for `beginWrite()`/`endWrite()` to ever wait on or fail to acquire.
+
+Correct use is assumed, not checked. `SeqLock` takes it as given that there is exactly one writer: a
+single thread issuing one `beginWrite()`/`endWrite()` section at a time. Using it with more than one
+writer results in undefined behavior.
 
 **Reading, retrying until consistent** (any number of threads):
 

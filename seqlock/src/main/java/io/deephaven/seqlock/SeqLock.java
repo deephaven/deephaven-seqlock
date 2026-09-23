@@ -31,6 +31,10 @@ import java.util.concurrent.TimeUnit;
  *       optionally retrying if the read was not consistent.
  * </ul>
  *
+ * <p>Correct use is assumed, not checked. {@code SeqLock} takes it as given that there is exactly
+ * one writer: a single thread issuing one {@link #beginWrite()}/{@link #endWrite()} section at a
+ * time. Using it with more than one writer results in undefined behavior.
+ *
  * <p>Typical writer usage:
  *
  * <pre>{@code
@@ -84,9 +88,6 @@ import java.util.concurrent.TimeUnit;
  * writer mutates in place — a field read through such a reference after {@code validate} happens
  * outside the window, unvalidated. Everything else — computation on the values, or waiting for a
  * condition — belongs after a successful {@code validate}, operating on the copies.
- *
- * <p>Use {@link java.util.concurrent.locks.StampedLock} when multiple writer support or blocking
- * semantics are needed.
  */
 public final class SeqLock {
 
@@ -128,6 +129,9 @@ public final class SeqLock {
    *
    * <p>Always returns immediately: there is no lock to wait for and no retry loop, regardless of
    * how many readers are active.
+   *
+   * <p>Must only ever be called by the single writer (see the class documentation); calls from more
+   * than one writer result in undefined behavior.
    */
   public void beginWrite() {
     assert isReadStampImpl(writerSeq);
