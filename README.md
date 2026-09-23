@@ -106,26 +106,6 @@ if (lock.isReadStamp(stamp)) {
 progress, so its result is always a valid stamp to read against — you only need to retry after
 `validate()` fails, not after `beginRead()` itself.
 
-**Polling with a bounded total wait, without spinning** — like `tryBeginRead()`, but retries
-internally on a timer instead of leaving that to the caller. Prefer this over `beginRead()` on a
-virtual thread: `Thread.sleep` releases the carrier between polls, where the busy-spin inside
-`beginRead()` does not.
-
-```java
-long stamp = lock.tryBeginRead(1, 100, TimeUnit.MILLISECONDS); // poll every 1ms, give up after 100ms
-if (lock.isReadStamp(stamp)) {
-    int localX = sharedX;
-    int localY = sharedY;
-    if (lock.validate(stamp)) {
-        // localX, localY are consistent
-    }
-}
-```
-
-This variant ignores interruption while polling — `tryBeginReadInterruptible(pollInterval,
-totalWait, unit)` takes the same arguments but propagates `InterruptedException` instead,
-mirroring how `beginReadInterruptible()` relates to `beginRead()`.
-
 ## The memory model contract
 
 Fields read or written under a `SeqLock` do **not** need to be `volatile` — the lock's own fences
@@ -133,12 +113,13 @@ establish the ordering for everything between `beginWrite`/`endWrite` and `begin
 
 Keep the code between `beginRead()` and `validate()` to plain copying: load the shared fields, store
 them into locals (or a caller-owned object, as in the examples above), nothing else. Whether that
-copy is written inline or in a method called from there doesn't matter. Copy *values*, though, not
-references to objects the writer mutates in place — a field read through such a reference after
-`validate()` happens outside the window. Everything else — computation on the values, or waiting for
-a condition (a loop spinning on a plain field there is the broken example in
-[JLS §17.3](https://docs.oracle.com/javase/specs/jls/se8/html/jls-17.html#jls-17.3)) — belongs
-after a successful `validate()`, operating on the copies.
+copy is written inline or in a method called from there doesn't matter. Copying a reference is fine
+when the object behind it is immutable (`String`, `Instant`, an unmodifiable collection the writer
+never touches again) and the writer swaps in a new object rather than mutating the old one:
+validating the reference then validates everything reachable through it. It is not fine for an
+object the writer mutates in place — a field read through such a reference after `validate()`
+happens outside the window, unvalidated. Everything else — computation on the values, or waiting for
+a condition — belongs after a successful `validate()`, operating on the copies.
 
 ## Protecting a group of related fields
 
@@ -233,7 +214,8 @@ stats.
 
 See the [`SeqLock` javadoc](seqlock/src/main/java/io/deephaven/seqlock/SeqLock.java) for
 the full method list, including `beginReadInterruptible()` for a spin that responds to thread
-interruption.
+interruption, and the `tryBeginRead(pollInterval, totalWait, unit)` variants that sleep between
+attempts instead of spinning.
 
 ## License
 

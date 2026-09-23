@@ -43,17 +43,6 @@ import java.util.concurrent.TimeUnit;
  * }
  * }</pre>
  *
- * <p>Typical reader usage (try-once):
- *
- * <pre>{@code
- * long stamp = lock.beginRead();
- * int localX = sharedX;
- * int localY = sharedY;
- * if (lock.validate(stamp)) {
- *     // localX, localY are consistent
- * }
- * }</pre>
- *
  * <p>Typical reader usage (retry until consistent):
  *
  * <pre>{@code
@@ -71,23 +60,7 @@ import java.util.concurrent.TimeUnit;
  *
  * <pre>{@code
  * long stamp = lock.tryBeginRead();
- * if (isReadStamp(stamp)) {
- *     int localX = sharedX;
- *     int localY = sharedY;
- *     if (lock.validate(stamp)) {
- *         // localX, localY are consistent
- *     }
- * }
- * }</pre>
- *
- * <p>Typical reader usage (poll with a bounded total wait, no spin) — see {@link
- * #tryBeginRead(long, long, TimeUnit)} for when this is preferable to {@link #beginRead()}, and
- * {@link #tryBeginReadInterruptible(long, long, TimeUnit)} for a variant that propagates
- * interruption instead of ignoring it, mirroring {@link #beginReadInterruptible()}.
- *
- * <pre>{@code
- * long stamp = lock.tryBeginRead(1, 100, TimeUnit.MILLISECONDS);
- * if (isReadStamp(stamp)) {
+ * if (lock.isReadStamp(stamp)) {
  *     int localX = sharedX;
  *     int localY = sharedY;
  *     if (lock.validate(stamp)) {
@@ -104,12 +77,13 @@ import java.util.concurrent.TimeUnit;
  * <p>Keep the code between {@code beginRead} and {@code validate} to plain copying: load the shared
  * fields, store them into locals (or a caller-owned object), nothing else. Whether that copy is
  * written inline or in a method called from there doesn't matter — the fences cover every read that
- * sits between the two calls in program order. Copy <em>values</em>, though, not references to
- * objects the writer mutates in place: a field read through such a reference after {@code validate}
- * happens outside the window. Everything else — computation on the values, or waiting for a
- * condition (a loop spinning on a plain field there is the broken example in <a
- * href="https://docs.oracle.com/javase/specs/jls/se8/html/jls-17.html#jls-17.3">JLS &sect;17.3</a>)
- * — belongs after a successful {@code validate}, operating on the copies.
+ * sits between the two calls in program order. Copying a reference is fine when the object behind
+ * it is immutable ({@code String}, {@code Instant}, an unmodifiable collection the writer never
+ * touches again) and the writer swaps in a new object rather than mutating the old one: validating
+ * the reference then validates everything reachable through it. It is not fine for an object the
+ * writer mutates in place — a field read through such a reference after {@code validate} happens
+ * outside the window, unvalidated. Everything else — computation on the values, or waiting for a
+ * condition — belongs after a successful {@code validate}, operating on the copies.
  *
  * <p>Use {@link java.util.concurrent.locks.StampedLock} when multiple writer support or blocking
  * semantics are needed.
@@ -201,10 +175,98 @@ public final class SeqLock {
    * it is as if the caller has called {@link #beginRead()}; otherwise, the caller should discard
    * the invalid read stamp.
    *
+   * <pre>{@code
+   * long stamp = lock.tryBeginRead();
+   * if (lock.isReadStamp(stamp)) {
+   *     int localX = sharedX;
+   *     int localY = sharedY;
+   *     if (lock.validate(stamp)) {
+   *         // localX, localY are consistent
+   *     }
+   * }
+   * }</pre>
+   *
    * @return a potential read stamp
    */
   public long tryBeginRead() {
     return sequence;
+  }
+
+  /**
+   * Begins an optimistic read.
+   *
+   * <p>If a write is currently in progress this method spins until the write completes before
+   * returning, ensuring the caller always starts from a consistent sequence boundary.
+   *
+   * <p>After reading, the stamp <b>must</b> be {@link #validate(long) validated} to ensure the read
+   * was consistent. This should almost always be a loop that retries until validation succeeds:
+   *
+   * <pre>{@code
+   * long stamp;
+   * int localX, localY;
+   * do {
+   *     stamp = lock.beginRead();
+   *     localX = sharedX;
+   *     localY = sharedY;
+   * } while (!lock.validate(stamp));
+   * // localX, localY are consistent
+   * }</pre>
+   *
+   * <p>Callers that would rather give up than retry — treating a stale read as an acceptable
+   * outcome — should use {@link #tryBeginRead()} instead.
+   *
+   * @return a read stamp ({@link #isReadStamp(long)} is guaranteed to return {@code true})
+   */
+  public long beginRead() {
+    long stamp;
+    // (A) volatile read - acquire: state reads can't rise above (A). Spin while write is in
+    // progress.
+    while (!isReadStampImpl(stamp = sequence)) {
+      ThreadShim.onSpinWait();
+    }
+    return stamp;
+  }
+
+  /**
+   * Same as {@link #beginRead()}, but propagates interruption instead of ignoring it: checked once
+   * before spinning, and again on each iteration of the spin.
+   *
+   * <p>After reading, the stamp <b>must</b> be {@link #validate(long) validated} to ensure the read
+   * was consistent.
+   *
+   * @return a read stamp ({@link #isReadStamp(long)} is guaranteed to return {@code true})
+   * @throws InterruptedException if interrupted before or while spinning
+   */
+  public long beginReadInterruptible() throws InterruptedException {
+    if (Thread.interrupted()) {
+      throw new InterruptedException();
+    }
+    long stamp;
+    // (A) volatile read — acquire: state reads can't rise above (A). Spin while write is in
+    // progress.
+    while (!isReadStampImpl(stamp = sequence)) {
+      ThreadShim.onSpinWait();
+      if (Thread.interrupted()) {
+        throw new InterruptedException();
+      }
+    }
+    return stamp;
+  }
+
+  /**
+   * Validates that the shared state read since the matching {@link #beginRead()} was consistent
+   * (i.e., no write overlapped the read window).
+   *
+   * @param stamp the value returned by {@link #beginRead()}
+   * @return {@code true} if the read was consistent; {@code false} if the caller should discard the
+   *     values and retry if necessary
+   */
+  public boolean validate(final long stamp) {
+    assert isReadStampImpl(stamp);
+    // (B) state reads from the read window can't sink below (C)
+    VarHandleShim.acquireFence();
+    // (C) volatile read - sequence unchanged -> read was consistent
+    return sequence == stamp;
   }
 
   /**
@@ -300,68 +362,5 @@ public final class SeqLock {
       }
     } while (System.nanoTime() - startNanos < totalWaitNanos);
     return stamp;
-  }
-
-  /**
-   * Begins an optimistic read.
-   *
-   * <p>If a write is currently in progress this method spins until the write completes before
-   * returning, ensuring the caller always starts from a consistent sequence boundary.
-   *
-   * <p>After reading, the stamp <b>must</b> be {@link #validate(long) validated} to ensure the read
-   * was consistent.
-   *
-   * @return a read stamp ({@link #isReadStamp(long)} is guaranteed to return {@code true})
-   */
-  public long beginRead() {
-    long stamp;
-    // (A) volatile read - acquire: state reads can't rise above (A). Spin while write is in
-    // progress.
-    while (!isReadStampImpl(stamp = sequence)) {
-      ThreadShim.onSpinWait();
-    }
-    return stamp;
-  }
-
-  /**
-   * Same as {@link #beginRead()}, but propagates interruption instead of ignoring it: checked once
-   * before spinning, and again on each iteration of the spin.
-   *
-   * <p>After reading, the stamp <b>must</b> be {@link #validate(long) validated} to ensure the read
-   * was consistent.
-   *
-   * @return a read stamp ({@link #isReadStamp(long)} is guaranteed to return {@code true})
-   * @throws InterruptedException if interrupted before or while spinning
-   */
-  public long beginReadInterruptible() throws InterruptedException {
-    if (Thread.interrupted()) {
-      throw new InterruptedException();
-    }
-    long stamp;
-    // (A) volatile read — acquire: state reads can't rise above (A). Spin while write is in
-    // progress.
-    while (!isReadStampImpl(stamp = sequence)) {
-      ThreadShim.onSpinWait();
-      if (Thread.interrupted()) {
-        throw new InterruptedException();
-      }
-    }
-    return stamp;
-  }
-
-  /**
-   * Validates that the shared state read since the matching {@link #beginRead()} was consistent
-   * (i.e., no write overlapped the read window).
-   *
-   * @param stamp the value returned by {@link #beginRead()}
-   * @return {@code true} if the read was consistent; {@code false} if the caller should discard the
-   *     values and retry if necessary
-   */
-  public boolean validate(final long stamp) {
-    assert isReadStampImpl(stamp);
-    // (B) state reads from the read window can't sink below (C)
-    VarHandleShim.acquireFence();
-    // (C) volatile read - sequence unchanged -> read was consistent
-    return sequence == stamp;
   }
 }
