@@ -123,33 +123,68 @@ a condition — belongs after a successful `validate()`, operating on the copies
 
 ## Protecting a group of related fields
 
-`SeqLock` itself only knows about one sequence counter — it has no idea how many fields you're
-protecting or how they relate to each other. That choice is the caller's, and it changes what
-consistency guarantee readers actually get. This comes up constantly for a hot path that's updating
-several related fields together — say, a request counter and an accumulated latency total for it —
-and wants to publish them to any number of concurrent readers.
-
-**Recommended: accumulate locally, publish as a batch.** Have the hot path write to plain
-(non-shared, non-`volatile`) local fields with no locking at all, and periodically copy all of them
-into the shared, `SeqLock`-protected fields in a single `beginWrite()`/`endWrite()` pair:
+A hot path often updates several related fields together — say, a request counter and the
+accumulated latency total behind it — and wants to publish them to any number of concurrent readers,
+who need to see them as a consistent set. Below are two shapes of that, sharing one `Stats` holder:
+`RequestStats` makes every update its own write section, while `RequestStatsBatched` has the hot
+path write to plain (non-shared, non-`volatile`) local fields with no locking at all and
+periodically copies all of them into the shared fields in a single `beginWrite()`/`endWrite()` pair.
 
 ```java
+final class Stats {
+    long count;
+    long totalElapsedNanos;
+
+    void copyFrom(Stats other) {
+        count = other.count;
+        totalElapsedNanos = other.totalElapsedNanos;
+    }
+}
+
 final class RequestStats {
     private final SeqLock lock = SeqLock.newInstance();
 
-    // reader-visible; written only inside beginWrite()/endWrite(), read only inside
-    // beginRead()/validate() (via read()/snapshot())
+    // written only inside beginWrite()/endWrite(), read only inside beginRead()/validate()
+    private final Stats shared = new Stats();
+
+    /** Writer thread only. */
+    void recordSuccess(long elapsedNanos) {
+        lock.beginWrite();
+        try {
+            shared.count++;
+            shared.totalElapsedNanos += elapsedNanos;
+        } finally {
+            lock.endWrite();
+        }
+    }
+
+    /** Any reader thread, any time -- no allocation. */
+    void read(Stats out) {
+        long stamp;
+        do {
+            stamp = lock.beginRead();
+            out.copyFrom(shared);
+        } while (!lock.validate(stamp));
+    }
+}
+
+final class RequestStatsBatched {
+    private final SeqLock lock = SeqLock.newInstance();
+
+    // written only inside beginWrite()/endWrite(), read only inside beginRead()/validate()
     private final Stats shared = new Stats();
 
     // writer-thread-local; nothing else ever touches this, so it needs no protection at all
     private final Stats local = new Stats();
 
-    void recordSuccess(long elapsedNanos) {          // the hot path: no lock, no publish
+    /** Writer thread only. The hot path: no lock, no publish. */
+    void recordSuccess(long elapsedNanos) {
         local.count++;
         local.totalElapsedNanos += elapsedNanos;
     }
 
-    void publish() {                                 // call this on whatever interval you choose
+    /** Writer thread only. Call this on whatever interval you choose. */
+    void publish() {
         lock.beginWrite();
         try {
             shared.copyFrom(local);
@@ -158,34 +193,38 @@ final class RequestStats {
         }
     }
 
-    void read(Stats out) {                            // any reader thread, any time -- no allocation
+    /** Any reader thread, any time -- no allocation. */
+    void read(Stats out) {
         long stamp;
         do {
             stamp = lock.beginRead();
             out.copyFrom(shared);
         } while (!lock.validate(stamp));
     }
-
-    static final class Stats {
-        long count;
-        long totalElapsedNanos;
-
-        void copyFrom(Stats other) {
-            count = other.count;
-            totalElapsedNanos = other.totalElapsedNanos;
-        }
-    }
 }
 ```
 
-Because `count` and `totalElapsedNanos` are always written together inside one
-`beginWrite()`/`endWrite()` pair, a reader that gets a validated stamp is guaranteed to see them as
-they existed at the *same instant* — never `count` from one publish and `totalElapsedNanos` from
-the next. How often `publish()` runs is entirely up to you: once per batch, once a second, whatever
-matches how fresh your downstream consumers need the data to be.
+Both give readers the same guarantee: `count` and `totalElapsedNanos` are always written together
+inside one `beginWrite()`/`endWrite()` pair, so a reader that gets a validated stamp sees them as
+they existed at the *same instant* — never `count` from one update and `totalElapsedNanos` from the
+next. They differ in where the cost lands and how fresh the data is:
 
-`Stats` plays three roles here — the shared, published state; the writer-local accumulator; and,
-via `read(Stats)`, an allocation-free target a caller supplies for a read — rather than three
+- **`RequestStats`** puts a write section on the hot path. `beginWrite()`/`endWrite()` are cheap and
+  unconditional, but not free, and every one of them is a chance to overlap a reader's window and
+  send that reader around its loop again — the busier the hot path, the more often readers retry.
+  In exchange, readers always see the latest recorded value, and there is nothing to schedule.
+- **`RequestStatsBatched`** takes the hot path down to two plain increments — no fences, no volatile
+  writes — and writes to the shared fields only in `publish()`, so readers rarely collide with a
+  write no matter how hot the path is. In exchange, what readers see is only as fresh as the last
+  `publish()`, and you have to decide when to call it: once per batch, once a second, whatever
+  matches how fresh your downstream consumers need the data to be.
+
+Start with `RequestStats`; reach for `RequestStatsBatched` when the hot path is hot enough that the
+per-update write section shows up, or when consumers are fine with data that lags by a publish
+interval anyway.
+
+In both, `Stats` doubles as the shared state and as the allocation-free target a caller supplies to
+`read(Stats)` (and, in the batched version, as the writer-local accumulator too), rather than
 separate sets of fields, so adding a new field only means touching `Stats` once. A caller who
 doesn't mind allocating can wrap `read(Stats)` in a convenience `snapshot()` that allocates a fresh
 `Stats` and returns it; a caller on their own hot path can instead keep one `Stats` instance and
@@ -193,22 +232,10 @@ call `read(Stats)` repeatedly, exactly as `RequestStatsExampleTest`'s reader thr
 
 See
 [`RequestStatsExampleTest`](seqlock/src/test/java/io/deephaven/seqlock/RequestStatsExampleTest.java)
-for a complete, runnable version of this — including a concurrent stress test that fails if any
-reader ever observes `count` and `totalElapsedNanos` out of sync with each other (and which really
-does fail if you break the pattern; see that test's neighbor,
+for a complete, runnable version of the batched variant — including a concurrent stress test that
+fails if any reader ever observes `count` and `totalElapsedNanos` out of sync with each other (and
+which really does fail if you break the pattern; see that test's neighbor,
 [`RequestStatsExample`](seqlock/src/test/java/io/deephaven/seqlock/RequestStatsExample.java)).
-
-**A setter per field, each with its own `beginWrite()`/`endWrite()`, is a *different* guarantee.**
-Each individual field is atomically consistent on its own, but there's no guarantee that two fields
-set by two *separate* calls were ever true at the same instant. That's fine when the fields are
-genuinely independent of each other (a request counter here, an unrelated config flag there); it's
-a bug waiting to happen if a reader expects two independently-set fields to be mutually consistent.
-
-**A setter per logical group works for the same reason batch-publish does.** If `count` and
-`totalElapsedNanos` above always change together, but some other field — say, a rarely-changing
-concurrency limit — is independent of both, giving that field its own `beginWrite()`/`endWrite()`
-setter is fine: it's its own group, with its own internal consistency, uncoupled from the request
-stats.
 
 ## API reference
 
