@@ -23,7 +23,6 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -41,7 +40,7 @@ class SeqLockTest {
   @Test
   void tryBeginRead() {
     final long stamp = lock.tryBeginRead();
-    assertThat(lock.isReadStamp(stamp)).isTrue();
+    assertThat(stamp).isNotZero();
     assertThat(lock.validate(stamp)).isTrue();
   }
 
@@ -75,6 +74,21 @@ class SeqLockTest {
   }
 
   @Test
+  void validateRejectsAStampTakenDuringAWrite() {
+    // A tryBeginRead() during a write returns 0. A caller who skips the check could still pass it
+    // to validate(), which must reject it on its own -- the sequence is never 0 -- rather than
+    // pass a read taken mid-write off as consistent.
+    lock.beginWrite();
+    try {
+      final long stamp = lock.tryBeginRead();
+      assertThat(stamp).isZero();
+      assertThat(lock.validate(stamp)).isFalse();
+    } finally {
+      lock.endWrite();
+    }
+  }
+
+  @Test
   void staleStampNeverValidatesAgain() {
     final long stamp = lock.beginRead();
     for (int i = 0; i < 1000; i++) {
@@ -82,41 +96,6 @@ class SeqLockTest {
       lock.endWrite();
       assertThat(lock.validate(stamp)).isFalse();
     }
-  }
-
-  @Test
-  void beginReadInterruptible() throws InterruptedException {
-    final long stamp = lock.beginReadInterruptible();
-    assertThat(lock.validate(stamp)).isTrue();
-  }
-
-  @Test
-  void beginReadInterruptibleThrowsIfInterrupted() {
-    Thread.currentThread().interrupt();
-    try {
-      lock.beginReadInterruptible();
-      failBecauseExceptionWasNotThrown(InterruptedException.class);
-    } catch (InterruptedException e) {
-      // expected
-    }
-  }
-
-  @Test
-  void beginReadInterruptibleThrowsIfInterruptedWhileSpinning() throws InterruptedException {
-    // Interrupt from another thread, ~30ms in, so the interrupt lands while beginReadInterruptible
-    // is spinning on the held write -- interrupting up front would instead trip its initial
-    // interrupted() check before it ever spun.
-    final Thread interrupter = interruptCurrentThreadAfter(30);
-    lock.beginWrite();
-    try {
-      lock.beginReadInterruptible();
-      failBecauseExceptionWasNotThrown(InterruptedException.class);
-    } catch (InterruptedException e) {
-      // expected; throwing it also cleared the interrupt flag
-    } finally {
-      lock.endWrite();
-    }
-    interrupter.join();
   }
 
   @Test
@@ -138,104 +117,10 @@ class SeqLockTest {
   void tryBeginReadDuringWrite() {
     lock.beginWrite();
     try {
-      assertThat(lock.isReadStamp(lock.tryBeginRead())).isFalse();
+      assertThat(lock.tryBeginRead()).isZero();
     } finally {
       lock.endWrite();
     }
-  }
-
-  @Test
-  void tryBeginReadPollNoWriteInProgress() {
-    final long stamp = lock.tryBeginRead(5, 1000, TimeUnit.MILLISECONDS);
-    assertThat(lock.isReadStamp(stamp)).isTrue();
-    assertThat(lock.validate(stamp)).isTrue();
-  }
-
-  @Test
-  void tryBeginReadPollTimesOutDuringWrite() {
-    lock.beginWrite();
-    try {
-      final long stamp = lock.tryBeginRead(5, 30, TimeUnit.MILLISECONDS);
-      assertThat(lock.isReadStamp(stamp)).isFalse();
-    } finally {
-      lock.endWrite();
-    }
-  }
-
-  @Test
-  void tryBeginReadPollSucceedsAfterWriteCompletes() throws InterruptedException {
-    final long[] protectedValue = new long[1];
-    final Thread writer = startWriterHoldingWriteSection(protectedValue);
-    final long stamp = lock.tryBeginRead(5, 2000, TimeUnit.MILLISECONDS);
-    writer.join();
-    assertThat(lock.isReadStamp(stamp)).isTrue();
-    assertThat(lock.validate(stamp)).isTrue();
-    assertThat(protectedValue[0]).isEqualTo(42L);
-  }
-
-  @Test
-  void tryBeginReadPollIntervalRoundedUpToOneMilli() throws InterruptedException {
-    final long[] protectedValue = new long[1];
-    final Thread writer = startWriterHoldingWriteSection(protectedValue);
-    // 0 would round down to a 0ms Thread.sleep() without the 1ms floor, degrading into a busy
-    // loop for the whole totalWait instead of actually sleeping between polls.
-    final long stamp = lock.tryBeginRead(0, 2000, TimeUnit.MILLISECONDS);
-    writer.join();
-    assertThat(lock.isReadStamp(stamp)).isTrue();
-    assertThat(lock.validate(stamp)).isTrue();
-    assertThat(protectedValue[0]).isEqualTo(42L);
-  }
-
-  @Test
-  void tryBeginReadPollIgnoresInterruption() throws InterruptedException {
-    final long[] protectedValue = new long[1];
-    final Thread writer = startWriterHoldingWriteSection(protectedValue);
-    Thread.currentThread().interrupt();
-    final long stamp = lock.tryBeginRead(5, 2000, TimeUnit.MILLISECONDS);
-    // Doesn't abort polling on interruption, but restores the flag before returning so the caller
-    // can still observe it. Thread.interrupted() both checks and clears it, which also keeps the
-    // still-set flag from making writer.join() below throw.
-    assertThat(Thread.interrupted()).isTrue();
-    writer.join();
-    assertThat(lock.isReadStamp(stamp)).isTrue();
-    assertThat(lock.validate(stamp)).isTrue();
-    assertThat(protectedValue[0]).isEqualTo(42L);
-  }
-
-  @Test
-  void tryBeginReadInterruptiblePollNoWriteInProgress() throws InterruptedException {
-    final long stamp = lock.tryBeginReadInterruptible(5, 1000, TimeUnit.MILLISECONDS);
-    assertThat(lock.isReadStamp(stamp)).isTrue();
-    assertThat(lock.validate(stamp)).isTrue();
-  }
-
-  @Test
-  void tryBeginReadInterruptiblePollThrowsIfInterrupted() {
-    Thread.currentThread().interrupt();
-    try {
-      lock.tryBeginReadInterruptible(10, 1000, TimeUnit.MILLISECONDS);
-      failBecauseExceptionWasNotThrown(InterruptedException.class);
-    } catch (InterruptedException e) {
-      // expected; throwing it also cleared the interrupt flag
-    }
-  }
-
-  @Test
-  void tryBeginReadInterruptiblePollThrowsIfInterruptedDuringWait() throws InterruptedException {
-    // Interrupt from another thread, ~30ms in, so the interrupt lands while
-    // tryBeginReadInterruptible is asleep between polls -- interrupting up front would instead trip
-    // its initial interrupted() check before it ever slept.
-    final Thread interrupter = interruptCurrentThreadAfter(30);
-    lock.beginWrite();
-    try {
-      lock.tryBeginReadInterruptible(5, 2000, TimeUnit.MILLISECONDS);
-      failBecauseExceptionWasNotThrown(InterruptedException.class);
-    } catch (InterruptedException e) {
-      // expected; throwing it also cleared the interrupt flag
-    } finally {
-      lock.endWrite();
-    }
-    interrupter.join();
   }
 
   @Test
@@ -323,24 +208,6 @@ class SeqLockTest {
     writer.start();
     writeStarted.await();
     return writer;
-  }
-
-  /** Starts a thread that interrupts the calling thread after ~{@code delayMillis}. */
-  private static Thread interruptCurrentThreadAfter(long delayMillis) {
-    final Thread target = Thread.currentThread();
-    final Thread interrupter =
-        new Thread(
-            () -> {
-              try {
-                Thread.sleep(delayMillis);
-              } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return;
-              }
-              target.interrupt();
-            });
-    interrupter.start();
-    return interrupter;
   }
 
   private static void shouldError(Runnable runnable) {

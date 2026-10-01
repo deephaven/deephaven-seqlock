@@ -15,25 +15,17 @@
  */
 package io.deephaven.seqlock;
 
-import java.util.concurrent.TimeUnit;
-
 /**
- * SeqLock, a writer-biased optimistic concurrency primitive.
+ * Sequence lock: a writer-biased concurrency primitive for publishing shared state from one writer
+ * thread to any number of reader threads. The writes are wait-free and the reads are optimistic
+ * with optional retry.
  *
- * <p>Guarantees:
- *
- * <ul>
- *   <li>A single writer thread may mutate shared state via a single, unconditional pass: {@link
- *       #beginWrite()}/{@link #endWrite()} always succeed on the first attempt, in a bounded number
- *       of steps, with no blocking, no compare-and-swap retry loop, and no dependence on what
- *       readers are doing.
- *   <li>Any number of reader threads may optimistically read shared state without acquiring a lock,
- *       optionally retrying if the read was not consistent.
- * </ul>
+ * <p>Unlike {@link java.util.concurrent.locks.Lock} and many other concurrency primitives, writes
+ * do not signal, wake, or actively notify readers. Readers learn of a change only by reading.
  *
  * <p>Correct use is assumed, not checked. {@code SeqLock} takes it as given that there is exactly
  * one writer: a single thread issuing one {@link #beginWrite()}/{@link #endWrite()} section at a
- * time. Using it with more than one writer results in undefined behavior.
+ * time. Using it with more than one concurrent writer results in undefined behavior.
  *
  * <p>Typical writer usage:
  *
@@ -50,8 +42,8 @@ import java.util.concurrent.TimeUnit;
  * <p>Typical reader usage (retry until consistent):
  *
  * <pre>{@code
- * long stamp;
  * int localX, localY;
+ * long stamp;
  * do {
  *     stamp = lock.beginRead();
  *     localX = sharedX;
@@ -60,11 +52,11 @@ import java.util.concurrent.TimeUnit;
  * // localX, localY are consistent
  * }</pre>
  *
- * <p>Typical reader usage (try-once, no spin).
+ * <p>Typical reader usage (no retry):
  *
  * <pre>{@code
  * long stamp = lock.tryBeginRead();
- * if (lock.isReadStamp(stamp)) {
+ * if (stamp != 0) {
  *     int localX = sharedX;
  *     int localY = sharedY;
  *     if (lock.validate(stamp)) {
@@ -74,50 +66,37 @@ import java.util.concurrent.TimeUnit;
  * }</pre>
  *
  * <p><b>Memory model contract:</b> shared fields read/written under this lock do <i>not</i> need to
- * be {@code volatile}. The caller is responsible for placing field accesses strictly between {@code
- * beginWrite}/{@code endWrite} and {@code beginRead}/{@code validate}. The fences inside this class
- * enforce the required ordering.
+ * be {@code volatile}. The caller is responsible for placing shared field stores strictly between
+ * {@code beginWrite}/{@code endWrite} and shared field loads strictly between {@code
+ * beginRead}/{@code validate}. The fences inside this class enforce the required ordering: if
+ * {@code validate} returns {@code true}, every write made in write sections that ended before the
+ * stamp was obtained <i>happens-before</i> the reads between {@code beginRead} and {@code
+ * validate}; if it returns {@code false}, nothing is guaranteed about those reads, and the copies
+ * must be discarded. The only cost readers impose on the writer is the ordinary cache-coherence
+ * price of sharing memory: a reader's load of a guarded cache line makes the writer's next store to
+ * that line reclaim ownership.
  *
  * <p>Keep the code between {@code beginRead} and {@code validate} to plain copying: load the shared
- * fields, store them into locals (or a caller-owned object), nothing else. Whether that copy is
- * written inline or in a method called from there doesn't matter — the fences cover every read that
- * sits between the two calls in program order. Copying a reference is fine when the object behind
- * it is immutable ({@code String}, {@code Instant}, an unmodifiable collection the writer never
- * touches again) and the writer swaps in a new object rather than mutating the old one: validating
- * the reference then validates everything reachable through it. It is not fine for an object the
- * writer mutates in place — a field read through such a reference after {@code validate} happens
- * outside the window, unvalidated. Everything else — computation on the values, or waiting for a
- * condition — belongs after a successful {@code validate}, operating on the copies.
+ * fields, store them into locals (or a caller-owned object), nothing else. Copying an immutable
+ * reference is fine.
  */
 public final class SeqLock {
 
-  static final long ORIGIN = 2;
+  static final long ORIGIN = 1;
 
-  // read by readers; written by writer
+  // read by readers; written by writer. Odd: readable (a read stamp); even: write in progress.
+  // 0 is even, so it is never a read stamp -- tryBeginRead returns it to mean "write in progress".
   private volatile long sequence = ORIGIN;
 
   // writer-private; allows writers to manage state without needing to do a volatile read
   private long writerSeq = ORIGIN;
 
   /**
-   * Creates a new {@link SeqLock}. This is the recommended way to construct a {@link SeqLock} for
-   * most callers.
-   *
-   * <p>Currently, this is equivalent to {@link #newInstanceUnpadded()}, but this may change in the
-   * future.
+   * Creates a new {@link SeqLock}.
    *
    * @return a new {@link SeqLock}.
    */
   public static SeqLock newInstance() {
-    return newInstanceUnpadded();
-  }
-
-  /**
-   * Creates a new, unpadded {@link SeqLock}.
-   *
-   * @return a new, unpadded {@link SeqLock}.
-   */
-  public static SeqLock newInstanceUnpadded() {
     return new SeqLock();
   }
 
@@ -125,18 +104,31 @@ public final class SeqLock {
 
   /**
    * Marks the start of a write section. Should be paired with {@link #endWrite()} in a finally
-   * block.
+   * block:
    *
-   * <p>Always returns immediately: there is no lock to wait for and no retry loop, regardless of
-   * how many readers are active.
+   * <pre>{@code
+   * lock.beginWrite();
+   * try {
+   *     sharedX = 42;
+   *     sharedY = 99;
+   * } finally {
+   *     lock.endWrite();
+   * }
+   * }</pre>
    *
-   * <p>Must only ever be called by the single writer (see the class documentation); calls from more
-   * than one writer result in undefined behavior.
+   * <p>Always returns immediately regardless of how many readers are active.
+   *
+   * <p>Must only ever be called by the single writer; calls from more than one writer result in
+   * undefined behavior.
    */
   public void beginWrite() {
-    assert isReadStampImpl(writerSeq);
-    // (1) plain increment + volatile write -> odd, signals write-in-progress
-    sequence = ++writerSeq;
+    assert (writerSeq & 1) != 0;
+    // (1) volatile write -> even, signals write-in-progress. Published first so that the store
+    // that takes ownership of the line is the one readers need to see; the writer-private copy
+    // follows as a write hit on a line the writer already owns.
+    final long next = writerSeq + 1;
+    sequence = next;
+    writerSeq = next;
     // Release: prior stores can't sink below (1).
     // (2) prevents subsequent state stores from rising above (1)
     VarHandleShim.storeStoreFence();
@@ -146,42 +138,30 @@ public final class SeqLock {
    * Marks the end of a write section. Should be called in a finally block to ensure the sequence is
    * always restored to a consistent state even if the write throws.
    *
-   * <p>Always returns immediately: there is no lock to wait for and no retry loop, regardless of
-   * how many readers are active.
+   * <p>Always returns immediately regardless of how many readers are active.
    */
   public void endWrite() {
-    assert !isReadStampImpl(writerSeq);
+    assert (writerSeq & 1) == 0;
     // (3) state stores happen here (caller's code, between begin/end)
-    // (4) plain increment + volatile write -> even, signals write-complete
-    sequence = ++writerSeq;
+    // (4) volatile write -> odd, signals write-complete; see (1) for the ordering.
+    final long next = writerSeq + 1;
+    sequence = next;
+    writerSeq = next;
     // Release: state stores can't sink below (4). No extra fence needed.
-  }
-
-  /**
-   * Checks if the stamp is valid for reading.
-   *
-   * @param stamp the stamp
-   * @return {@code true} if the stamp can be used for reading; {@code false} if the caller should
-   *     discard the stamp and retry if necessary
-   */
-  public boolean isReadStamp(final long stamp) {
-    return isReadStampImpl(stamp);
-  }
-
-  private static boolean isReadStampImpl(long stamp) {
-    return (stamp & 1) == 0;
   }
 
   /**
    * Try to begin an optimistic read.
    *
-   * <p>The return value <b>must</b> be checked against {@link #isReadStamp(long)}. If {@code true},
-   * it is as if the caller has called {@link #beginRead()}; otherwise, the caller should discard
-   * the invalid read stamp.
+   * <p>Always returns immediately: returns a read stamp if available, otherwise returns {@code 0}
+   * signalling a write is in progress.
+   *
+   * <p>After reading, the stamp <b>must</b> be {@link #validate(long) validated} to ensure the read
+   * was consistent.
    *
    * <pre>{@code
    * long stamp = lock.tryBeginRead();
-   * if (lock.isReadStamp(stamp)) {
+   * if (stamp != 0) {
    *     int localX = sharedX;
    *     int localY = sharedY;
    *     if (lock.validate(stamp)) {
@@ -190,20 +170,39 @@ public final class SeqLock {
    * }
    * }</pre>
    *
-   * @return a potential read stamp
+   * <p>Callers may choose to opt out checking if a write is in progress since {@code validate(0)}
+   * will always return {@code false}.
+   *
+   * <pre>{@code
+   * long stamp = lock.tryBeginRead();
+   * int localX = sharedX;
+   * int localY = sharedY;
+   * if (lock.validate(stamp)) {
+   *     // localX, localY are consistent
+   * }
+   * }</pre>
+   *
+   * @return a read stamp, or {@code 0} if a write is in progress
    */
   public long tryBeginRead() {
-    return sequence;
+    final long stamp = sequence;
+    // A branch, not a ternary: the write-in-progress case is rare, so this predicts perfectly,
+    // while the ternary tends to become a conditional move that adds to every attempt's dependency
+    // chain.
+    if ((stamp & 1) == 0) {
+      return 0L;
+    }
+    return stamp;
   }
 
   /**
    * Begins an optimistic read.
    *
-   * <p>If a write is currently in progress this method spins until the write completes before
-   * returning, ensuring the caller always starts from a consistent sequence boundary.
+   * <p>If a write is currently in progress this method spins until a write is no longer in progress
+   * (invoking {@code Thread.onSpinWait()} between attempts on Java 11+).
    *
-   * <p>After reading, the stamp <b>must</b> be {@link #validate(long) validated} to ensure the read
-   * was consistent. This should almost always be a loop that retries until validation succeeds:
+   * <p>After reading, the read stamp <b>must</b> be {@link #validate(long) validated} to ensure the
+   * read was consistent.
    *
    * <pre>{@code
    * long stamp;
@@ -216,155 +215,41 @@ public final class SeqLock {
    * // localX, localY are consistent
    * }</pre>
    *
-   * <p>Callers that would rather give up than retry — treating a stale read as an acceptable
-   * outcome — should use {@link #tryBeginRead()} instead.
+   * <p>Callers that would rather give up than retry should use {@link #tryBeginRead()} instead.
    *
-   * @return a read stamp ({@link #isReadStamp(long)} is guaranteed to return {@code true})
+   * @return a read stamp
    */
   public long beginRead() {
     long stamp;
     // (A) volatile read - acquire: state reads can't rise above (A). Spin while write is in
     // progress.
-    while (!isReadStampImpl(stamp = sequence)) {
+    while (((stamp = sequence) & 1) == 0) {
       ThreadShim.onSpinWait();
-    }
-    return stamp;
-  }
-
-  /**
-   * Same as {@link #beginRead()}, but propagates interruption instead of ignoring it: checked once
-   * before spinning, and again on each iteration of the spin.
-   *
-   * <p>After reading, the stamp <b>must</b> be {@link #validate(long) validated} to ensure the read
-   * was consistent.
-   *
-   * @return a read stamp ({@link #isReadStamp(long)} is guaranteed to return {@code true})
-   * @throws InterruptedException if interrupted before or while spinning
-   */
-  public long beginReadInterruptible() throws InterruptedException {
-    if (Thread.interrupted()) {
-      throw new InterruptedException();
-    }
-    long stamp;
-    // (A) volatile read — acquire: state reads can't rise above (A). Spin while write is in
-    // progress.
-    while (!isReadStampImpl(stamp = sequence)) {
-      ThreadShim.onSpinWait();
-      if (Thread.interrupted()) {
-        throw new InterruptedException();
-      }
     }
     return stamp;
   }
 
   /**
    * Validates that the shared state read since the matching {@link #beginRead()} was consistent
-   * (i.e., no write overlapped the read window).
+   * (i.e., no write overlapped the read window). A {@code true} result means every write made in
+   * write sections that ended before the stamp was obtained happens-before the reads in the window;
+   * a {@code false} result means nothing about those reads, and the copies must be discarded.
    *
-   * @param stamp the value returned by {@link #beginRead()}
+   * <p>Always returns {@code false} for {@code 0}, the value {@link #tryBeginRead()} returns while
+   * a write is in progress. Invoking it with a value not obtained from one of the {@code beginRead}
+   * or {@code tryBeginRead} methods of this lock has no defined result.
+   *
+   * @param stamp the value returned by {@link #beginRead()} or {@link #tryBeginRead()}
    * @return {@code true} if the read was consistent; {@code false} if the caller should discard the
    *     values and retry if necessary
    */
   public boolean validate(final long stamp) {
-    assert isReadStampImpl(stamp);
     // (B) state reads from the read window can't sink below (C)
     VarHandleShim.acquireFence();
-    // (C) volatile read - sequence unchanged -> read was consistent
+    // (C) volatile read - sequence unchanged -> read was consistent. 0 (tryBeginRead during a
+    // write) never validates: read stamps are odd and 0 is even, so the sequence equals 0 only
+    // while a write is in progress, when no read stamp equals it either. A forgotten check fails
+    // here rather than passing torn data through.
     return sequence == stamp;
-  }
-
-  /**
-   * Try to begin an optimistic read, polling with {@link Thread#sleep(long)} between attempts if a
-   * write is in progress, up to a bounded total wait. Doesn't abort polling on interruption — but
-   * if interrupted, restores the thread's interrupt status just before returning, so the caller can
-   * still observe and respond to it afterward. Use {@link #tryBeginReadInterruptible(long, long,
-   * TimeUnit)} instead for a variant that propagates {@link InterruptedException} immediately
-   * rather than continuing to poll.
-   *
-   * <p>Unlike {@link #beginRead()}, this does not busy-spin: on a virtual thread, {@code
-   * Thread.sleep} releases the carrier between polls, where {@code Thread.onSpinWait()} does not.
-   * The tradeoff is latency — the caller only learns a write completed on the next poll, up to
-   * {@code pollInterval} later than {@link #beginRead()} would have.
-   *
-   * <p>Each poll always sleeps a full {@code pollInterval}, rather than clamping the final sleep to
-   * land exactly on {@code totalWait} — so the total time spent may exceed {@code totalWait} by up
-   * to one {@code pollInterval}.
-   *
-   * <p>The return value <b>must</b> be checked against {@link #isReadStamp(long)}, exactly as with
-   * {@link #tryBeginRead()}: reaching {@code totalWait} without an intervening write completing is
-   * not an error, it just means the caller gets back the last (write-in-progress) stamp observed.
-   *
-   * @param pollInterval how long to sleep between polls, and the maximum staleness of learning that
-   *     a write completed; rounded up to 1 millisecond if smaller, since {@link Thread#sleep(long)}
-   *     only has millisecond resolution
-   * @param totalWait the maximum total time to spend polling before giving up, plus up to one more
-   *     {@code pollInterval}
-   * @param unit the unit both {@code pollInterval} and {@code totalWait} are expressed in
-   * @return a potential read stamp
-   */
-  public long tryBeginRead(final long pollInterval, final long totalWait, final TimeUnit unit) {
-    long stamp;
-    if (isReadStampImpl(stamp = sequence)) {
-      return stamp;
-    }
-    final long totalWaitNanos = unit.toNanos(totalWait);
-    if (totalWaitNanos <= 0) {
-      return stamp;
-    }
-    final long pollIntervalMillis = Math.max(1, unit.toMillis(pollInterval));
-    final long startNanos = System.nanoTime();
-    boolean interrupted = false;
-    do {
-      try {
-        Thread.sleep(pollIntervalMillis);
-      } catch (InterruptedException e) {
-        // Captured, not propagated or restored immediately -- restoring it here would make
-        // every later Thread.sleep() in this loop immediately re-throw too, degrading into a
-        // busy loop for the rest of totalWait. Restored once, below, just before returning.
-        interrupted = true;
-      }
-    } while (!isReadStampImpl(stamp = sequence) && System.nanoTime() - startNanos < totalWaitNanos);
-    if (interrupted) {
-      Thread.currentThread().interrupt();
-    }
-    return stamp;
-  }
-
-  /**
-   * Same as {@link #tryBeginRead(long, long, TimeUnit)}, but propagates interruption instead of
-   * ignoring it, mirroring {@link #beginReadInterruptible()}.
-   *
-   * @param pollInterval how long to sleep between polls, and the maximum staleness of learning that
-   *     a write completed; rounded up to 1 millisecond if smaller, since {@link Thread#sleep(long)}
-   *     only has millisecond resolution
-   * @param totalWait the maximum total time to spend polling before giving up, plus up to one more
-   *     {@code pollInterval}
-   * @param unit the unit both {@code pollInterval} and {@code totalWait} are expressed in
-   * @return a potential read stamp
-   * @throws InterruptedException if interrupted before or while sleeping between polls
-   */
-  public long tryBeginReadInterruptible(
-      final long pollInterval, final long totalWait, final TimeUnit unit)
-      throws InterruptedException {
-    if (Thread.interrupted()) {
-      throw new InterruptedException();
-    }
-    long stamp;
-    if (isReadStampImpl(stamp = sequence)) {
-      return stamp;
-    }
-    final long totalWaitNanos = unit.toNanos(totalWait);
-    if (totalWaitNanos <= 0) {
-      return stamp;
-    }
-    final long pollIntervalMillis = Math.max(1, unit.toMillis(pollInterval));
-    final long startNanos = System.nanoTime();
-    do {
-      Thread.sleep(pollIntervalMillis);
-      if (isReadStampImpl(stamp = sequence)) {
-        return stamp;
-      }
-    } while (System.nanoTime() - startNanos < totalWaitNanos);
-    return stamp;
   }
 }

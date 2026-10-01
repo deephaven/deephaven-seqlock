@@ -1,30 +1,41 @@
 # SeqLock
 
-A writer-biased optimistic concurrency primitive for Java: a single writer thread mutates shared
-state without ever blocking, and any number of reader threads read that state without acquiring a
-lock, retrying only if a write happened to overlap their read.
+Sequence lock: a writer-biased concurrency primitive for publishing shared state from one writer
+thread to any number of reader threads. The writes are wait-free and the reads are optimistic with
+optional retry.
+
+Unlike `java.util.concurrent.locks.Lock` and many other concurrency primitives, writes do not
+signal, wake, or actively notify readers. Readers learn of a change only by reading.
 
 ## Why
 
-The write path is the whole point: `beginWrite()`/`endWrite()` always succeed on the first
-attempt, in a bounded, fixed number of steps — no lock to wait for, no compare-and-swap retry
-loop, no dependence on what readers are doing. Contrast that with most "lock-free" designs, where
-the writer itself is the thing that loops (CAS, retry, CAS again) under contention; `SeqLock`
-avoids that entirely because it only ever supports one writer, so there's nothing to contend with
-on the write side.
+The write path `beginWrite()`/`endWrite()` always succeeds on the first attempt, in a bounded, fixed
+number of steps — no lock to wait for, no compare-and-swap retry loop, and nothing in its control
+flow that depends on what readers are doing.
 
-Readers get an intentionally different deal: no lock either, but they *may* need to retry if a
-write happened to land mid-read. A `ReentrantReadWriteLock` still makes every reader take a lock,
-so readers contend with each other (and with the writer) even when nothing is being written.
-`SeqLock` doesn't care how often reads happen relative to writes — writes stay cheap and
-unconditional either way — but it does assume reads are cheap enough to redo: the more often (or
-the longer) writes happen, the more often a given reader's window may land on one and need a
-retry, so keep both the write section and the read section short.
+### Use-case: hot-path writer
+
+The advice usually given for seqlocks is "use one when reads vastly outnumber writes". That is a
+fine case for it, but it is one case, and it misses the situation where the primitive really shines:
+**a hot-path writer that must never be blocked by a traditional lock**. Think of a thread whose job
+is latency-sensitive — a request handler, a market-data or event-processing loop, a scheduler tick,
+a game or simulation step — that also has to expose some of its state to other threads: counters and
+timings for monitoring, the latest value of something, a small status record. With a mutex,
+`synchronized`, or a read-write lock, every reader that happens to hold the lock at the wrong moment
+stalls the hot path, and the cost of a stall is set by the reader (and by the OS, if it has to park
+and unpark a thread). With a `SeqLock` the writer's cost is a fixed sequence of stores and fences
+per section, never a wait, however many readers there are. The read side pays instead with
+occasional retries.
+
+That also means it is the right tool when writes are *frequent*, as long as there are write-free
+gaps long enough (and frequent enough) to satisfy readers. A batching strategy outlined in
+[protecting a group of related fields](#protecting-a-group-of-related-fields) may be used to ensure
+long enough write-free gaps.
 
 ## Requirements
 
-Java 8+. `seqlock` ships as a multi-release JAR: the same jar runs on Java 8, but automatically
-uses `VarHandle`/`Thread.onSpinWait()` instead of internal APIs when run on Java 11+.
+Java 8+. `seqlock` ships as a multi-release JAR: the same jar runs on Java 8, but automatically uses
+`VarHandle`/`Thread.onSpinWait()` instead of internal APIs when run on Java 11+.
 
 ## Installation
 
@@ -44,8 +55,8 @@ dependencies {
 </dependency>
 ```
 
-This project is still pre-1.0 (currently `0.1.0-SNAPSHOT`) and not yet published to Maven Central
-— check with whoever gave you access to this repository for how to depend on it in the meantime.
+This project is still pre-1.0 (currently `0.1.0-SNAPSHOT`) and not yet published to Maven Central —
+check with whoever gave you access to this repository for how to depend on it in the meantime.
 
 ## Usage
 
@@ -73,7 +84,7 @@ there's nothing for `beginWrite()`/`endWrite()` to ever wait on or fail to acqui
 
 Correct use is assumed, not checked. `SeqLock` takes it as given that there is exactly one writer: a
 single thread issuing one `beginWrite()`/`endWrite()` section at a time. Using it with more than one
-writer results in undefined behavior.
+concurrent writer results in undefined behavior.
 
 **Reading, retrying until consistent** (any number of threads):
 
@@ -88,12 +99,12 @@ do {
 // localX, localY are consistent
 ```
 
-**Reading once, without spinning** — useful when a stale read is an acceptable outcome, not just
-an intermediate step to retry away:
+**Reading once, without spinning** — useful when a stale read is an acceptable outcome, not just an
+intermediate step to retry away:
 
 ```java
 long stamp = lock.tryBeginRead();
-if (lock.isReadStamp(stamp)) {
+if (stamp != 0) {
     int localX = sharedX;
     int localY = sharedY;
     if (lock.validate(stamp)) {
@@ -102,24 +113,25 @@ if (lock.isReadStamp(stamp)) {
 }
 ```
 
-`beginRead()` differs from `tryBeginRead()` in that it spins internally until no write is in
-progress, so its result is always a valid stamp to read against — you only need to retry after
-`validate()` fails, not after `beginRead()` itself.
+`tryBeginRead()` returns 0 while a write is in progress, and `validate(0)` is always false.
+`beginRead()` differs in that it spins internally until no write is in progress, so its result is
+always a valid stamp to read against — you only need to retry after `validate()` fails, not after
+`beginRead()` itself.
 
 ## The memory model contract
 
 Fields read or written under a `SeqLock` do **not** need to be `volatile` — the lock's own fences
-establish the ordering for everything between `beginWrite`/`endWrite` and `beginRead`/`validate`.
+establish the ordering for everything between `beginWrite`/`endWrite` and `beginRead`/`validate`: if
+`validate()` returns true, every write made in write sections that ended before the stamp was
+obtained *happens-before* the reads between `beginRead()` and `validate()`; if it returns false,
+nothing is guaranteed about those reads, and the copies must be discarded.
 
 Keep the code between `beginRead()` and `validate()` to plain copying: load the shared fields, store
-them into locals (or a caller-owned object, as in the examples above), nothing else. Whether that
-copy is written inline or in a method called from there doesn't matter. Copying a reference is fine
-when the object behind it is immutable (`String`, `Instant`, an unmodifiable collection the writer
-never touches again) and the writer swaps in a new object rather than mutating the old one:
-validating the reference then validates everything reachable through it. It is not fine for an
-object the writer mutates in place — a field read through such a reference after `validate()`
-happens outside the window, unvalidated. Everything else — computation on the values, or waiting for
-a condition — belongs after a successful `validate()`, operating on the copies.
+them into locals (or a caller-owned object), nothing else. Copying an immutable reference is fine.
+
+The only cost readers impose on the writer is the ordinary cache-coherence price of sharing memory:
+a reader's load of a guarded cache line makes the writer's next store to that line reclaim
+ownership.
 
 ## Protecting a group of related fields
 
@@ -211,8 +223,8 @@ next. They differ in where the cost lands and how fresh the data is:
 
 - **`RequestStats`** puts a write section on the hot path. `beginWrite()`/`endWrite()` are cheap and
   unconditional, but not free, and every one of them is a chance to overlap a reader's window and
-  send that reader around its loop again — the busier the hot path, the more often readers retry.
-  In exchange, readers always see the latest recorded value, and there is nothing to schedule.
+  send that reader around its loop again — the busier the hot path, the more often readers retry. In
+  exchange, readers always see the latest recorded value, and there is nothing to schedule.
 - **`RequestStatsBatched`** takes the hot path down to two plain increments — no fences, no volatile
   writes — and writes to the shared fields only in `publish()`, so readers rarely collide with a
   write no matter how hot the path is. In exchange, what readers see is only as fresh as the last
@@ -239,10 +251,8 @@ which really does fail if you break the pattern; see that test's neighbor,
 
 ## API reference
 
-See the [`SeqLock` javadoc](seqlock/src/main/java/io/deephaven/seqlock/SeqLock.java) for
-the full method list, including `beginReadInterruptible()` for a spin that responds to thread
-interruption, and the `tryBeginRead(pollInterval, totalWait, unit)` variants that sleep between
-attempts instead of spinning.
+See the [`SeqLock` javadoc](seqlock/src/main/java/io/deephaven/seqlock/SeqLock.java) for the full
+method list.
 
 ## License
 

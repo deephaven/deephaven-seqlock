@@ -18,6 +18,7 @@ package io.deephaven.seqlock;
 final class ThreadShim {
 
   public static void onSpinWait() {
-    Thread.yield();
+    // Does not exist in Java 8
+    // Thread.onSpinWait();
   }
 }
