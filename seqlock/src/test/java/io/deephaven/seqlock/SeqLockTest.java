@@ -89,6 +89,25 @@ class SeqLockTest {
   }
 
   @Test
+  void zeroNeverValidatesAcrossTheCounterWrap() throws ReflectiveOperationException {
+    // The one section where writerSeq + 1 would be 0: readable -1, then a write. Every stored
+    // value has the mark bit set, so the write-in-progress value is Long.MIN_VALUE, not 0, and
+    // validate(0) stays false even for a caller that skipped the tryBeginRead() check.
+    setSequence(-1L);
+    lock.beginWrite();
+    try {
+      assertThat(lock.tryBeginRead()).isZero();
+      assertThat(lock.validate(0)).isFalse();
+    } finally {
+      lock.endWrite();
+    }
+    final long stamp = lock.beginRead();
+    assertThat(stamp).isNotZero();
+    assertThat(lock.validate(stamp)).isTrue();
+    assertThat(lock.validate(0)).isFalse();
+  }
+
+  @Test
   void staleStampNeverValidatesAgain() {
     final long stamp = lock.beginRead();
     for (int i = 0; i < 1000; i++) {
@@ -186,6 +205,17 @@ class SeqLockTest {
    * section has begun, so on return a write is known to be in progress; join the returned thread to
    * know it has ended.
    */
+  /**
+   * Forces the sequence to {@code value} (which must be odd: readable) through the private fields.
+   */
+  private void setSequence(long value) throws ReflectiveOperationException {
+    for (String field : new String[] {"sequence", "writerSeq"}) {
+      final java.lang.reflect.Field f = SeqLock.class.getDeclaredField(field);
+      f.setAccessible(true);
+      f.setLong(lock, value);
+    }
+  }
+
   private Thread startWriterHoldingWriteSection(long[] protectedValue) throws InterruptedException {
     final CountDownLatch writeStarted = new CountDownLatch(1);
     final Thread writer =

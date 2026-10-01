@@ -82,10 +82,15 @@ package io.deephaven.seqlock;
  */
 public final class SeqLock {
 
-  static final long ORIGIN = 1;
+  // Set in every sequence value the writer stores, so no value is ever 0: tryBeginRead returns 0
+  // to mean "write in progress", and validate(0) is then false by the same comparison that
+  // rejects any other stale stamp. The counter is the low 63 bits.
+  static final long MARK = Long.MIN_VALUE;
+
+  static final long ORIGIN = MARK | 1;
 
   // read by readers; written by writer. Odd: readable (a read stamp); even: write in progress.
-  // 0 is even, so it is never a read stamp -- tryBeginRead returns it to mean "write in progress".
+  // Always has MARK set, so never 0.
   private volatile long sequence = ORIGIN;
 
   // writer-private; allows writers to manage state without needing to do a volatile read
@@ -125,8 +130,9 @@ public final class SeqLock {
     assert (writerSeq & 1) != 0;
     // (1) volatile write -> even, signals write-in-progress. Published first so that the store
     // that takes ownership of the line is the one readers need to see; the writer-private copy
-    // follows as a write hit on a line the writer already owns.
-    final long next = writerSeq + 1;
+    // follows as a write hit on a line the writer already owns. The OR keeps MARK set across the
+    // one carry that could clear it (-1 + 1); endWrite adds 1 to an even value and cannot.
+    final long next = (writerSeq + 1) | MARK;
     sequence = next;
     writerSeq = next;
     // Release: prior stores can't sink below (1).
@@ -247,9 +253,8 @@ public final class SeqLock {
     // (B) state reads from the read window can't sink below (C)
     VarHandleShim.acquireFence();
     // (C) volatile read - sequence unchanged -> read was consistent. 0 (tryBeginRead during a
-    // write) never validates: read stamps are odd and 0 is even, so the sequence equals 0 only
-    // while a write is in progress, when no read stamp equals it either. A forgotten check fails
-    // here rather than passing torn data through.
+    // write) never validates: every sequence value has MARK set, so none is ever 0, and a
+    // forgotten check fails here rather than passing torn data through.
     return sequence == stamp;
   }
 }
