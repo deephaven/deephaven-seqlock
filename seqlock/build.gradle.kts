@@ -12,9 +12,9 @@ repositories {
 group = "io.deephaven.seqlock"
 version = "0.1.0-SNAPSHOT"
 description =
-    "A writer-biased optimistic concurrency primitive for Java: a single writer thread mutates " +
-    "shared state without ever blocking, and any number of reader threads read that state " +
-    "without acquiring a lock, retrying only if a write happened to overlap their read."
+    "Sequence lock: a writer-biased concurrency primitive for publishing shared state from one writer " +
+    "thread to any number of reader threads. The writes are wait-free and the reads are optimistic with " +
+    "optional retry."
 
 dependencies {
     testImplementation(libs.junit.jupiter)
